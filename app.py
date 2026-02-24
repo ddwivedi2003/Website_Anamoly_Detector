@@ -1,108 +1,118 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from sklearn.ensemble import IsolationForest
+import requests
+import time
+from datetime import datetime
 
 # --- Page Config ---
-st.set_page_config(page_title="Real-Time Anomaly Detector", layout="wide")
+st.set_page_config(page_title="Live Site Monitor", layout="wide")
+st.title("⚡ Real-Time Website Anomaly Monitor")
 
-st.title("🔎 Anomaly Detection on Real Data")
-st.markdown("""
-Upload your CSV file (e.g., server logs, sales data, sensor readings). 
-The app will automatically detect spikes and irregularities using **Isolation Forest**.
-""")
+# --- 1. Session State (The App's Memory) ---
+# We need to store data between "refreshes" or it will disappear.
+if 'monitor_data' not in st.session_state:
+    st.session_state.monitor_data = []
 
-# --- 1. File Upload Section ---
-uploaded_file = st.sidebar.file_uploader("Upload CSV", type=["csv"])
-
-if uploaded_file is not None:
-    # Read the file
-    try:
-        df = pd.read_csv(uploaded_file)
-        
-        # Check if data loaded correctly
-        st.write("### Raw Data Preview")
-        st.dataframe(df.head())
-
-        # --- 2. Column Selection ---
-        # We need the user to tell us which column is Time and which is the Value
-        st.sidebar.header("Data Mapping")
-        
-        # Try to guess the date column (looks for 'date', 'time', 'timestamp' in name)
-        date_candidates = [col for col in df.columns if 'date' in col.lower() or 'time' in col.lower()]
-        default_date = date_candidates[0] if date_candidates else df.columns[0]
-        
-        time_col = st.sidebar.selectbox("Select Time Column", df.columns, index=df.columns.get_loc(default_date))
-        value_col = st.sidebar.selectbox("Select Value Column (Metric)", [c for c in df.columns if c != time_col])
-        
-        contamination = st.sidebar.slider("Anomaly Sensitivity", 0.01, 0.20, 0.02, 
-                                          help="Higher = more points flagged as anomalies.")
-
-        # --- 3. Data Preprocessing ---
-        # Convert time column to datetime objects
-        df[time_col] = pd.to_datetime(df[time_col], errors='coerce')
-        
-        # Drop rows where date parsing failed
-        df = df.dropna(subset=[time_col])
-        
-        # Sort by time (critical for plotting)
-        df = df.sort_values(by=time_col)
-
-        # --- 4. The AI (Isolation Forest) ---
-        # The model requires a 2D array, so we reshape the value column
-        X = df[[value_col]].values
-        
-        # Train model
-        model = IsolationForest(contamination=contamination, random_state=42)
-        model.fit(X)
-        
-        # Predict (-1 = Anomaly, 1 = Normal)
-        df['anomaly_score'] = model.predict(X)
-        df['status'] = df['anomaly_score'].apply(lambda x: 'Anomaly' if x == -1 else 'Normal')
-        
-        # --- 5. Visualization ---
-        st.divider()
-        st.subheader(f"Anomaly Analysis: {value_col}")
-
-        # Metrics
-        anomalies = df[df['status'] == 'Anomaly']
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Total Data Points", len(df))
-        col2.metric("Anomalies Found", len(anomalies), delta_color="inverse")
-        col3.metric("Avg Value", f"{df[value_col].mean():.2f}")
-
-        # Plotly Chart
-        fig = px.scatter(
-            df, 
-            x=time_col, 
-            y=value_col, 
-            color='status',
-            color_discrete_map={'Normal': '#00B4D8', 'Anomaly': '#FF4B4B'},
-            title=f"{value_col} over Time (Red = Anomaly)",
-            hover_data=[value_col]
-        )
-        
-        # Add a line connecting the dots (makes time series easier to read)
-        fig.add_scatter(x=df[time_col], y=df[value_col], mode='lines', 
-                        line=dict(color='gray', width=1), opacity=0.3, showlegend=False)
-
-        st.plotly_chart(fig, use_container_width=True)
-
-        # Show the actual bad data points
-        if not anomalies.empty:
-            st.warning("⚠️ Detected Anomalies List")
-            st.dataframe(anomalies[[time_col, value_col]].sort_values(by=value_col, ascending=False))
-
-    except Exception as e:
-        st.error(f"Error parsing file: {e}")
-
-else:
-    st.info("Waiting for CSV upload...")
-    st.write("No data? Download this sample CSV to test:")
+# --- 2. Sidebar Controls ---
+with st.sidebar:
+    st.header("Settings")
+    target_url = st.text_input("Target URL", "https://www.google.com")
+    interval = st.slider("Ping Interval (seconds)", 1, 10, 2)
+    threshold_multiplier = st.slider("Anomaly Sensitivity", 1.5, 5.0, 2.5,
+                                     help="Mark anomaly if latency is X times higher than average.")
     
-    # Create a small sample CSV for them to download if they have none
-    sample_data = pd.DataFrame({
-        'timestamp': pd.date_range(start='2024-01-01', periods=20, freq='H'),
-        'cpu_usage': [12, 15, 14, 13, 98, 14, 15, 12, 13, 11, 14, 15, 99, 12, 14, 13, 15, 14, 12, 13]
-    })
-    st.download_button("Download Sample CSV", sample_data.to_csv(index=False), "sample_data.csv", "text/csv")
+    # The "Switch" to turn the loop on/off
+    is_running = st.checkbox("🔴 Start Live Monitoring")
+    
+    if st.button("Clear History"):
+        st.session_state.monitor_data = []
+
+# --- 3. The Monitoring Loop ---
+# This placeholder allows us to update the chart without reloading the whole page
+chart_placeholder = st.empty()
+stats_placeholder = st.empty()
+
+if is_running:
+    while True:
+        # A. Ping the Site
+        try:
+            start_time = time.time()
+            response = requests.get(target_url, timeout=5)
+            latency = (time.time() - start_time) * 1000  # Convert to milliseconds
+            status_code = response.status_code
+        except Exception as e:
+            latency = 0
+            status_code = 500  # Error
+        
+        # B. Append to History
+        timestamp = datetime.now()
+        st.session_state.monitor_data.append({
+            'Timestamp': timestamp,
+            'Latency (ms)': latency,
+            'Status': status_code
+        })
+        
+        # Keep only the last 100 points to keep it fast
+        if len(st.session_state.monitor_data) > 100:
+            st.session_state.monitor_data.pop(0)
+            
+        # C. Calculate Anomalies (Rolling Z-Score Lite)
+        df = pd.DataFrame(st.session_state.monitor_data)
+        
+        # Calculate dynamic average (Rolling Mean of last 10 points)
+        if len(df) > 5:
+            rolling_avg = df['Latency (ms)'].rolling(window=10).mean().iloc[-1]
+            # If current latency is > Average * Multiplier -> It's an Anomaly
+            is_anomaly = latency > (rolling_avg * threshold_multiplier)
+        else:
+            is_anomaly = False
+            rolling_avg = latency
+
+        # D. Update the Chart
+        # We assign colors based on the anomaly status we just calculated
+        # Note: We rebuild the color list every frame for the chart
+        colors = ['red' if (x > rolling_avg * threshold_multiplier and i > 5) else 'blue' 
+                  for i, x in enumerate(df['Latency (ms)'])]
+
+        with chart_placeholder.container():
+            fig = px.bar(
+                df, 
+                x='Timestamp', 
+                y='Latency (ms)', 
+                title=f"Live Latency for {target_url}",
+                template="plotly_dark"
+            )
+            
+            # Update bar colors manually to show anomalies in Red
+            fig.update_traces(marker_color=colors)
+            
+            # Add a threshold line
+            fig.add_hline(y=rolling_avg * threshold_multiplier, line_dash="dot", 
+                          annotation_text="Anomaly Threshold", annotation_position="top right")
+            
+            st.plotly_chart(fig, use_container_width=True)
+
+        # E. Update Stats
+        with stats_placeholder.container():
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Current Latency", f"{latency:.0f} ms", 
+                        delta=f"{latency - rolling_avg:.0f} ms" if len(df) > 1 else 0,
+                        delta_color="inverse")
+            col2.metric("Status Code", status_code)
+            
+            if is_anomaly:
+                st.error(f"⚠️ Anomaly Detected! Latency spiked to {latency:.0f} ms")
+            else:
+                st.success("System Normal")
+
+        # F. Sleep before next ping
+        time.sleep(interval)
+        
+        # G. Stop logic: If user unchecks the box, Streamlit will rerun and stop the loop.
+else:
+    st.info("Check 'Start Live Monitoring' in the sidebar to begin.")
+    if len(st.session_state.monitor_data) > 0:
+        # Show the static chart if we stopped
+        df = pd.DataFrame(st.session_state.monitor_data)
+        st.dataframe(df.tail())
