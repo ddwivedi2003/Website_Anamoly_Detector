@@ -3,116 +3,112 @@ import pandas as pd
 import plotly.express as px
 import requests
 import time
+import numpy as np
 from datetime import datetime
+from sklearn.ensemble import IsolationForest
 
 # --- Page Config ---
-st.set_page_config(page_title="Live Site Monitor", layout="wide")
-st.title("⚡ Real-Time Website Anomaly Monitor")
+st.set_page_config(page_title="Live ML Anomaly Detector", layout="wide")
+st.title("🤖 Live AI/ML Website Anomaly Detection")
+st.markdown("This tool uses an **Isolation Forest** model that *retrains in real-time* on a sliding window of data.")
 
-# --- 1. Session State (The App's Memory) ---
-# We need to store data between "refreshes" or it will disappear.
-if 'monitor_data' not in st.session_state:
-    st.session_state.monitor_data = []
+# --- 1. Session State (The Short-Term Memory) ---
+# We store the last N data points to train the model
+if 'data_buffer' not in st.session_state:
+    st.session_state.data_buffer = []
 
 # --- 2. Sidebar Controls ---
 with st.sidebar:
-    st.header("Settings")
+    st.header("ML Configuration")
     target_url = st.text_input("Target URL", "https://www.google.com")
-    interval = st.slider("Ping Interval (seconds)", 1, 10, 2)
-    threshold_multiplier = st.slider("Anomaly Sensitivity", 1.5, 5.0, 2.5,
-                                     help="Mark anomaly if latency is X times higher than average.")
+    interval = st.slider("Ping Interval (seconds)", 0.5, 5.0, 1.0)
     
-    # The "Switch" to turn the loop on/off
-    is_running = st.checkbox("🔴 Start Live Monitoring")
+    # ML Hyperparameters
+    window_size = st.slider("Training Window Size", 20, 200, 50, 
+                           help="How many recent data points the AI learns from.")
+    contamination = st.slider("Anomaly Sensitivity", 0.01, 0.5, 0.1,
+                             help="The % of data the model expects to be anomalous.")
     
-    if st.button("Clear History"):
-        st.session_state.monitor_data = []
+    is_running = st.checkbox("🟢 Start AI Monitoring")
+    
+    if st.button("Clear Memory"):
+        st.session_state.data_buffer = []
 
-# --- 3. The Monitoring Loop ---
-# This placeholder allows us to update the chart without reloading the whole page
+# --- 3. The ML Loop ---
 chart_placeholder = st.empty()
 stats_placeholder = st.empty()
 
 if is_running:
     while True:
-        # A. Ping the Site
+        # A. Collect Real Data (Ping)
         try:
             start_time = time.time()
-            response = requests.get(target_url, timeout=5)
-            latency = (time.time() - start_time) * 1000  # Convert to milliseconds
-            status_code = response.status_code
-        except Exception as e:
-            latency = 0
-            status_code = 500  # Error
+            requests.get(target_url, timeout=3)
+            latency = (time.time() - start_time) * 1000  # ms
+        except:
+            latency = 3000  # High penalty for timeout
         
-        # B. Append to History
         timestamp = datetime.now()
-        st.session_state.monitor_data.append({
-            'Timestamp': timestamp,
-            'Latency (ms)': latency,
-            'Status': status_code
-        })
         
-        # Keep only the last 100 points to keep it fast
-        if len(st.session_state.monitor_data) > 100:
-            st.session_state.monitor_data.pop(0)
+        # B. Update Buffer (Sliding Window)
+        st.session_state.data_buffer.append({'time': timestamp, 'latency': latency})
+        
+        # Keep buffer size fixed (Remove oldest if too big)
+        if len(st.session_state.data_buffer) > window_size:
+            st.session_state.data_buffer.pop(0)
             
-        # C. Calculate Anomalies (Rolling Z-Score Lite)
-        df = pd.DataFrame(st.session_state.monitor_data)
+        # C. The "Brain" - Train ML Model on the fly
+        df = pd.DataFrame(st.session_state.data_buffer)
+        current_status = "Insufficient Data"
         
-        # Calculate dynamic average (Rolling Mean of last 10 points)
-        if len(df) > 5:
-            rolling_avg = df['Latency (ms)'].rolling(window=10).mean().iloc[-1]
-            # If current latency is > Average * Multiplier -> It's an Anomaly
-            is_anomaly = latency > (rolling_avg * threshold_multiplier)
+        # We need at least 10 points to train a decent model
+        if len(df) >= 10:
+            # 1. Prepare features (Isolation Forest needs 2D array)
+            X = df[['latency']].values
+            
+            # 2. Train Model (This happens every loop!)
+            model = IsolationForest(contamination=contamination, random_state=42)
+            model.fit(X)
+            
+            # 3. Predict Anomalies (-1 = Anomaly, 1 = Normal)
+            df['anomaly'] = model.predict(X)
+            
+            # Check the status of the *latest* point we just added
+            latest_is_anomaly = df.iloc[-1]['anomaly'] == -1
+            current_status = "⚠️ ANOMALY DETECTED" if latest_is_anomaly else "Normal"
+            
+            # Define colors for the graph based on ML results
+            df['color'] = df['anomaly'].apply(lambda x: 'red' if x == -1 else '#00CC96')
         else:
-            is_anomaly = False
-            rolling_avg = latency
+            # Not enough data yet, show neutral colors
+            df['color'] = 'gray'
+            latest_is_anomaly = False
 
-        # D. Update the Chart
-        # We assign colors based on the anomaly status we just calculated
-        # Note: We rebuild the color list every frame for the chart
-        colors = ['red' if (x > rolling_avg * threshold_multiplier and i > 5) else 'blue' 
-                  for i, x in enumerate(df['Latency (ms)'])]
-
+        # D. Visualization
         with chart_placeholder.container():
             fig = px.bar(
                 df, 
-                x='Timestamp', 
-                y='Latency (ms)', 
-                title=f"Live Latency for {target_url}",
+                x='time', 
+                y='latency', 
+                title=f"Real-Time Isolation Forest Analysis (Window: {len(df)})",
                 template="plotly_dark"
             )
-            
-            # Update bar colors manually to show anomalies in Red
-            fig.update_traces(marker_color=colors)
-            
-            # Add a threshold line
-            fig.add_hline(y=rolling_avg * threshold_multiplier, line_dash="dot", 
-                          annotation_text="Anomaly Threshold", annotation_position="top right")
-            
+            # Apply the colors determined by the ML model
+            fig.update_traces(marker_color=df['color'])
             st.plotly_chart(fig, use_container_width=True)
 
-        # E. Update Stats
+        # E. Stats Display
         with stats_placeholder.container():
             col1, col2, col3 = st.columns(3)
-            col1.metric("Current Latency", f"{latency:.0f} ms", 
-                        delta=f"{latency - rolling_avg:.0f} ms" if len(df) > 1 else 0,
-                        delta_color="inverse")
-            col2.metric("Status Code", status_code)
+            col1.metric("Live Latency", f"{latency:.0f} ms")
+            col2.metric("ML Confidence", f"{len(df)}/{window_size} samples")
             
-            if is_anomaly:
-                st.error(f"⚠️ Anomaly Detected! Latency spiked to {latency:.0f} ms")
+            if latest_is_anomaly:
+                col3.error(f"{current_status}")
             else:
-                st.success("System Normal")
+                col3.success(f"{current_status}")
 
-        # F. Sleep before next ping
         time.sleep(interval)
-        
-        # G. Stop logic: If user unchecks the box, Streamlit will rerun and stop the loop.
+
 else:
-    st.info("Check 'Start Live Monitoring' in the sidebar to begin.")
-    if len(st.session_state.monitor_data) > 0:
-        # Show the static chart if we stopped
-        df = pd.DataFrame(st.session_state.monitor_data)
-        st.dataframe(df.tail())
+    st.info("Start the monitor to let the AI learn the network patterns.")
